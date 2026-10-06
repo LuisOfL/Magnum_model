@@ -1,0 +1,7 @@
+path: C:\Users\luigu\OneDrive\Escritorio\Magnum_app\MVP
+train: C:\Users\luigu\OneDrive\Escritorio\Magnum_app\MVP\train.txt
+val: C:\Users\luigu\OneDrive\Escritorio\Magnum_app\MVP\val.txt
+
+names:
+  0: Magnum clasica
+  1: Oreo Mordizco
