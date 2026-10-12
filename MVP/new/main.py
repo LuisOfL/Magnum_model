@@ -8,17 +8,21 @@ from ultralytics import YOLO
 
 app = FastAPI(title="YOLO Detector API - Estimación de Inventario")
 
-# Detectar la ruta local donde está 'best.pt'
 BASE_DIR = Path(__file__).parent.resolve()
 MODEL_PATH = BASE_DIR / "best.pt"
+CLASSES_PATH = BASE_DIR / "classes.txt"
 
 if not MODEL_PATH.exists():
     raise FileNotFoundError(f"No se encontró el archivo de pesos en {MODEL_PATH}")
 
-# Cargar el modelo
 model = YOLO(str(MODEL_PATH))
 
-# Constante de inventario
+# Cargar las clases desde classes.txt por su índice de línea (0 a N)
+CLASS_NAMES = {}
+if CLASSES_PATH.exists():
+    with open(CLASSES_PATH, "r", encoding="utf-8") as f:
+        CLASS_NAMES = {i: line.strip() for i, line in enumerate(f) if line.strip()}
+
 CAPACIDAD_MAXIMA_POR_CANAL = 12
 
 
@@ -46,17 +50,24 @@ async def predict(file: UploadFile = File(...)):
         annotated_pil.save(buffer, format="JPEG")
         img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-        # 4. Algoritmo de Profundidad y Estimación
+        # 4. Extracción de cajas y mapeo de clases
         productos = []
         rejillas = []
 
         if result.boxes is not None and len(result.boxes) > 0:
             for box in result.boxes:
                 cls_id = int(box.cls[0].item())
-                nombre_clase = model.names[cls_id]
+                
+                # Mapeo prioritario con classes.txt
+                if cls_id in CLASS_NAMES:
+                    nombre_clase = CLASS_NAMES[cls_id]
+                elif hasattr(model, "names") and cls_id in model.names:
+                    nombre_clase = model.names[cls_id]
+                else:
+                    nombre_clase = f"Clase_{cls_id}"
+
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 
-                # Separar si el modelo ya detecta rejillas, sino lo hace, usa los bordes de la foto
                 if "rejilla" in nombre_clase.lower() or "canastilla" in nombre_clase.lower():
                     rejillas.append((x1, y1, x2, y2))
                 else:
@@ -69,13 +80,17 @@ async def predict(file: UploadFile = File(...)):
         detecciones_filtradas = []
         
         if productos:
-            # Agrupar productos en columnas (canales) basándose en su eje X
+            # 4.1 Contar todas las detecciones visibles en la foto
+            conteo_visibles = {}
+            for p in productos:
+                nom = p["nombre"]
+                conteo_visibles[nom] = conteo_visibles.get(nom, 0) + 1
+
+            # 4.2 Agrupar en columnas para estimación de profundidad
             productos.sort(key=lambda p: p["x_centro"])
             columnas = []
             col_actual = []
             x_ref = -1
-            
-            # Margen de 10% del ancho de la imagen para considerar que están en la misma columna
             margen_columna = img_width * 0.10  
             
             for p in productos:
@@ -91,16 +106,12 @@ async def predict(file: UploadFile = File(...)):
             if col_actual:
                 columnas.append(col_actual)
 
-            # Diccionario para sumar el stock total de cada producto en todo el congelador
-            inventario_total = {}
+            inventario_estimado = {}
 
-            # Calcular profundidad para cada columna detectada
             for col in columnas:
-                # El producto de hasta arriba es el que tiene la coordenada Y1 más pequeña (más cerca del 0)
                 top_prod = min(col, key=lambda p: p["y1"])
                 nombre = top_prod["nombre"]
                 
-                # Determinar los límites Y del canal (si no hay rejilla etiquetada, asume el 5% y 95% de la foto)
                 y_top = img_height * 0.05
                 y_bottom = img_height * 0.95
                 
@@ -110,26 +121,22 @@ async def predict(file: UploadFile = File(...)):
                         y_bottom = ry2
                         break
                 
-                # Matemática de estimación (0 a 1)
                 altura_total = max(1.0, y_bottom - y_top)
                 altura_ocupada = max(0.0, y_bottom - top_prod["y1"])
                 
-                ratio_llenado = altura_ocupada / altura_total
-                ratio_llenado = max(0.0, min(1.0, ratio_llenado)) # Asegurar que no pase de 100%
-                
-                # Calcular piezas reales y acumular
+                ratio_llenado = max(0.0, min(1.0, altura_ocupada / altura_total))
                 piezas_estimadas = int(round(ratio_llenado * CAPACIDAD_MAXIMA_POR_CANAL))
                 
-                if nombre not in inventario_total:
-                    inventario_total[nombre] = 0
-                inventario_total[nombre] += piezas_estimadas
+                inventario_estimado[nombre] = inventario_estimado.get(nombre, 0) + piezas_estimadas
 
-            # Formatear salida para Flet
-            detecciones_filtradas = [
-                {"etiqueta": k, "frecuencia": v}
-                for k, v in inventario_total.items()
-                if v > 0
-            ]
+            # 4.3 Consolidar todos los productos detectados
+            for nombre, count_vis in conteo_visibles.items():
+                stock_est = max(count_vis, inventario_estimado.get(nombre, 0))
+                detecciones_filtradas.append({
+                    "etiqueta": nombre,
+                    "visibles": count_vis,
+                    "frecuencia": stock_est
+                })
 
         return {
             "status": "success",
