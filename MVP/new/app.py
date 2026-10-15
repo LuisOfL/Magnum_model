@@ -4,26 +4,21 @@ import requests
 API_URL = "http://127.0.0.1:8000/predict"
 
 def main(page: ft.Page):
-    # 1. Configuración principal de la ventana (Modo Oscuro)
     page.title = "Smart Freezer Audit - IA"
     page.theme_mode = ft.ThemeMode.DARK
-    page.bgcolor = "#0B0F19"  # Fondo principal súper oscuro (Azul noche/Negro)
+    page.bgcolor = "#0B0F19"
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
     page.padding = 20
     page.scroll = ft.ScrollMode.AUTO
 
-    # 2. Barra de Navegación Superior (AppBar) elegante
     page.appbar = ft.AppBar(
         leading=ft.Icon(ft.Icons.ICECREAM, color="#38BDF8", size=28),
-        title=ft.Text("Ejemplo de mini mini modelo", weight=ft.FontWeight.W_600, color=ft.Colors.WHITE),
+        title=ft.Text("Smart Freezer Audit - Detección y Segmentación", weight=ft.FontWeight.W_600, color=ft.Colors.WHITE),
         center_title=True,
-        bgcolor="#111827", # Gris oscuro contrastante
+        bgcolor="#111827",
         elevation=2,
     )
 
-    # 3. Componentes visuales
-    
-    # 3.1 Contenedor de Alertas (Éxito / Error)
     alert_banner = ft.Container(
         content=ft.Text("", size=15, weight=ft.FontWeight.W_500),
         padding=15,
@@ -33,12 +28,11 @@ def main(page: ft.Page):
         border=ft.border.all(1, ft.Colors.TRANSPARENT)
     )
 
-    # 3.2 Indicador de Carga Animado
     loading_ring = ft.Container(
         content=ft.Row(
             controls=[
                 ft.ProgressRing(width=20, height=20, stroke_width=3, color="#38BDF8"),
-                ft.Text("Analizando profundidad e inventario...", size=16, color="#9CA3AF", weight=ft.FontWeight.W_400)
+                ft.Text("Procesando detección, segmentación y profundidad...", size=16, color="#9CA3AF", weight=ft.FontWeight.W_400)
             ],
             alignment=ft.MainAxisAlignment.CENTER,
             spacing=15
@@ -47,41 +41,70 @@ def main(page: ft.Page):
         margin=ft.margin.symmetric(vertical=15)
     )
 
-    # 3.3 Tarjeta para la Imagen Resultante
-    img_result = ft.Image(
-        width=700,
-        height=500,
-        fit=ft.ImageFit.CONTAIN,
-        border_radius=ft.border_radius.all(10),
-    )
-    img_card = ft.Container(
-        content=img_result,
-        bgcolor="#1F2937",  # Superficie elevada
+    img_result_det = ft.Image(width=500, height=380, fit=ft.ImageFit.CONTAIN, border_radius=ft.border_radius.all(10))
+    card_det = ft.Container(
+        content=ft.Column(
+            controls=[
+                ft.Text("Detección (Bounding Boxes)", size=16, weight=ft.FontWeight.W_600, color="#38BDF8"),
+                img_result_det,
+            ],
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=10,
+        ),
+        bgcolor="#1F2937",
         border_radius=15,
-        padding=10,
-        border=ft.border.all(1, "#374151"), # Borde sutil
-        shadow=ft.BoxShadow(blur_radius=20, spread_radius=2, color="#000000"),
-        visible=False,
+        padding=15,
+        border=ft.border.all(1, "#374151"),
+        shadow=ft.BoxShadow(blur_radius=15, color="#000000"),
     )
 
-    # 3.4 Tarjeta para la Tabla de Resultados
+    img_result_seg = ft.Image(width=500, height=380, fit=ft.ImageFit.CONTAIN, border_radius=ft.border_radius.all(10))
+    card_seg = ft.Container(
+        content=ft.Column(
+            controls=[
+                ft.Text("Segmentación (Polígonos)", size=16, weight=ft.FontWeight.W_600, color="#34D399"),
+                img_result_seg,
+            ],
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=10,
+        ),
+        bgcolor="#1F2937",
+        border_radius=15,
+        padding=15,
+        border=ft.border.all(1, "#374151"),
+        shadow=ft.BoxShadow(blur_radius=15, color="#000000"),
+    )
+
+    images_row = ft.Row(
+        controls=[card_det, card_seg],
+        alignment=ft.MainAxisAlignment.CENTER,
+        spacing=20,
+        visible=False,
+        wrap=True,
+    )
+
     table_results = ft.DataTable(
         columns=[
             ft.DataColumn(label=ft.Text("Producto Identificado", weight=ft.FontWeight.BOLD, color="#E5E7EB")),
-            ft.DataColumn(label=ft.Text("Stock Estimado (Piezas)", weight=ft.FontWeight.BOLD, color="#E5E7EB"), numeric=True),
+            ft.DataColumn(label=ft.Text("Visibles", weight=ft.FontWeight.BOLD, color="#E5E7EB"), numeric=True),
+            ft.DataColumn(label=ft.Text("Stock Estimado", weight=ft.FontWeight.BOLD, color="#E5E7EB"), numeric=True),
         ],
         rows=[],
-        width=600,
+        width=650,
         heading_row_color="#374151",
         border_radius=10,
         divider_thickness=0.5,
     )
+    
     table_card = ft.Container(
         content=ft.Column(
             controls=[
                 ft.Text("Resumen de Inventario", size=20, weight=ft.FontWeight.W_600, color="#38BDF8"),
                 ft.Divider(color="#374151"),
-                table_results
+                ft.Container(
+                    content=ft.Column([table_results], scroll=ft.ScrollMode.AUTO),
+                    height=350,
+                )
             ],
             horizontal_alignment=ft.CrossAxisAlignment.CENTER
         ),
@@ -91,17 +114,15 @@ def main(page: ft.Page):
         padding=25,
         shadow=ft.BoxShadow(blur_radius=20, spread_radius=2, color="#000000"),
         visible=False,
-        width=700
+        width=1040
     )
 
-    # 4. Lógica de subida y conexión con la API
     def on_file_selected(e: ft.FilePickerResultEvent):
         if not e.files or len(e.files) == 0:
             return
 
         file_path = e.files[0].path
-        
-        img_card.visible = False
+        images_row.visible = False
         table_card.visible = False
         alert_banner.visible = False
         loading_ring.visible = True
@@ -117,28 +138,33 @@ def main(page: ft.Page):
 
             if response.status_code == 200:
                 data = response.json()
-                
-                img_result.src_base64 = data["imagen_base64"]
-                img_card.visible = True
+                img_result_det.src_base64 = data["imagen_base64"]
+                img_result_seg.src_base64 = data.get("imagen_seg_base64", "")
+                images_row.visible = True
 
                 table_results.rows.clear()
-                detecciones = data["detecciones"]
+                detecciones = data.get("detecciones", [])
 
                 if detecciones:
                     total_piezas = 0
+                    total_visibles = 0
                     for item in detecciones:
-                        total_piezas += item["frecuencia"]
+                        stock = item.get("stock_estimado", item.get("frecuencia", 0))
+                        visibles = item.get("visibles", stock)
+                        total_piezas += stock
+                        total_visibles += visibles
+
                         table_results.rows.append(
                             ft.DataRow(
                                 cells=[
-                                    ft.DataCell(ft.Text(item["etiqueta"], color="#D1D5DB")),
-                                    ft.DataCell(ft.Text(str(item["frecuencia"]), weight=ft.FontWeight.BOLD, color="#34D399")),
+                                    ft.DataCell(ft.Text(item.get("etiqueta", "Desconocido"), color="#D1D5DB")),
+                                    ft.DataCell(ft.Text(str(visibles), weight=ft.FontWeight.BOLD, color="#38BDF8")),
+                                    ft.DataCell(ft.Text(str(stock), weight=ft.FontWeight.BOLD, color="#34D399")),
                                 ]
                             )
                         )
                     table_card.visible = True
-                    
-                    alert_banner.content.value = f"✅ Auditoría completada: {total_piezas} piezas estimadas."
+                    alert_banner.content.value = f"✅ Auditoría completada: {total_visibles} visibles / {total_piezas} piezas estimadas."
                     alert_banner.bgcolor = "#064E3B"
                     alert_banner.border = ft.border.all(1, "#059669")
                     alert_banner.content.color = "#6EE7B7"
@@ -147,7 +173,6 @@ def main(page: ft.Page):
                     alert_banner.bgcolor = "#451A03"
                     alert_banner.border = ft.border.all(1, "#D97706")
                     alert_banner.content.color = "#FCD34D"
-
             else:
                 detail = response.json().get("detail", "Error desconocido")
                 alert_banner.content.value = f"❌ Error en el backend: {detail}"
@@ -156,7 +181,7 @@ def main(page: ft.Page):
                 alert_banner.content.color = "#FCA5A5"
 
         except Exception as err:
-            alert_banner.content.value = f"❌ No se pudo conectar con el servidor: {err}"
+            alert_banner.content.value = f"❌ Error en la solicitud: {err}"
             alert_banner.bgcolor = "#450A0A"
             alert_banner.border = ft.border.all(1, "#DC2626")
             alert_banner.content.color = "#FCA5A5"
@@ -179,7 +204,7 @@ def main(page: ft.Page):
             alignment=ft.MainAxisAlignment.CENTER,
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
         ),
-        width=700,
+        width=1040,
         height=180,
         bgcolor="#1F2937",
         border_radius=15,
@@ -187,13 +212,7 @@ def main(page: ft.Page):
         ink=True,
         on_click=lambda _: file_picker.pick_files(allow_multiple=False, file_type=ft.FilePickerFileType.IMAGE),
         shadow=ft.BoxShadow(blur_radius=15, color="#000000"),
-        animate=ft.Animation(duration=300, curve=ft.AnimationCurve.EASE_OUT)  # <--- Corregido para Flet 0.28
     )
-
-    def on_hover_upload(e):
-        e.control.border = ft.border.all(2, "#38BDF8" if e.data == "true" else "#374151")
-        e.control.update()
-    upload_zone.on_hover = on_hover_upload
 
     page.add(
         ft.Column(
@@ -202,7 +221,7 @@ def main(page: ft.Page):
                 upload_zone,
                 loading_ring,
                 alert_banner,
-                img_card,
+                images_row,
                 table_card,
                 ft.Container(height=30),
             ],
