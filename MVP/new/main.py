@@ -1,5 +1,6 @@
 import base64
 import io
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -48,23 +49,30 @@ if CLASSES_PATH.exists():
     with open(CLASSES_PATH, "r", encoding="utf-8") as f:
         CLASS_NAMES = {i: line.strip() for i, line in enumerate(f) if line.strip()}
 
-# Capacidades predeterminadas por tipo de SKU
-CAPACIDADES_POR_SKU: Dict[str, int] = {
-    "Magnum": 12,
-    "Mordisko": 11,
-    "Cornetto": 10,
-    "Solero": 10,
-    "Pint": 8,
-    "DEFAULT": 12,  # 12 piezas por defecto a nivel de rejilla
+# ---------------------------------------------------------
+# Configuración NLP y Reglas de Capacidades por SKU
+# ---------------------------------------------------------
+# Diccionario fácil de editar para definir la capacidad total según palabras clave presentes en la etiqueta
+REGLAS_CAPACIDAD_TEXTO: Dict[str, int] = {
+    "mordisko": 11,
+    "mordizco": 11,
+    "paleta": 12,
+    "magnum": 12,
+    "solero": 12,
+    "cornetto": 10,
+    "pint": 8,
+    "DEFAULT": 12,  # De lo contrario caben 12 por defecto
 }
 
 # Paso de profundidad estimado por pieza (distancia relativa que ocupa 1 producto)
 PASO_PROFUNDIDAD_POR_SKU: Dict[str, float] = {
-    "Magnum": 0.050,
-    "Mordisko": 0.045,
-    "Cornetto": 0.050,
-    "Solero": 0.050,
-    "Pint": 0.060,
+    "mordisko": 0.045,
+    "mordizco": 0.045,
+    "paleta": 0.050,
+    "magnum": 0.050,
+    "solero": 0.050,
+    "cornetto": 0.050,
+    "pint": 0.060,
     "DEFAULT": 0.050,
 }
 
@@ -73,12 +81,34 @@ REJILLA_KEYWORDS = (
 )
 
 
-def obtener_config_sku(nombre: str, mapa_config: Dict, default_key="DEFAULT"):
-    """Busca la configuración correspondiente según la etiqueta del SKU."""
-    for clave, valor in mapa_config.items():
-        if clave != default_key and clave.lower() in nombre.lower():
-            return valor
-    return mapa_config[default_key]
+def normalizar_texto(texto: str) -> str:
+    """Limpia y normaliza el nombre del SKU para coincidencia de palabras clave."""
+    texto = texto.lower()
+    texto = re.sub(r"[^\w\s]", "", texto)
+    return texto.strip()
+
+
+def resolver_capacidad_sku(nombre_sku: str) -> int:
+    """
+    Usa NLP/coincidencia de texto para determinar la capacidad máxima.
+    - Si el texto contiene 'mordisko' o 'mordizco' -> 11 piezas
+    - Si contiene 'paleta' -> 12 piezas
+    - De lo contrario -> 12 piezas (o el valor en DEFAULT)
+    """
+    texto_limpio = normalizar_texto(nombre_sku)
+    for kw, capacidad in REGLAS_CAPACIDAD_TEXTO.items():
+        if kw != "DEFAULT" and kw in texto_limpio:
+            return capacidad
+    return REGLAS_CAPACIDAD_TEXTO["DEFAULT"]
+
+
+def resolver_paso_profundidad(nombre_sku: str) -> float:
+    """Obtiene el paso de profundidad correspondiente al tipo de SKU."""
+    texto_limpio = normalizar_texto(nombre_sku)
+    for kw, paso in PASO_PROFUNDIDAD_POR_SKU.items():
+        if kw != "DEFAULT" and kw in texto_limpio:
+            return paso
+    return PASO_PROFUNDIDAD_POR_SKU["DEFAULT"]
 
 
 def calcular_mapa_profundidad(pil_img: Image.Image) -> np.ndarray:
@@ -208,11 +238,13 @@ async def predict(file: UploadFile = File(...)):
         detalle_detecciones = []
         resumen_por_sku: Dict[str, Dict] = {}
 
-        # 4. Cálculo de diferencias de profundidad por cada SKU detectado
+        # 4. Cálculo de diferencias de profundidad e inventario por cada SKU
         for producto in productos:
             nombre = producto["nombre"]
-            capacidad_max = int(obtener_config_sku(nombre, CAPACIDADES_POR_SKU))
-            paso_profundidad = float(obtener_config_sku(nombre, PASO_PROFUNDIDAD_POR_SKU))
+
+            # Evaluación de NLP / Reglas para capacidad máxima y paso
+            capacidad_max = resolver_capacidad_sku(nombre)
+            paso_profundidad = resolver_paso_profundidad(nombre)
 
             # Rejilla de referencia asociada
             rejilla = buscar_rejilla_mas_cercana(producto, rejillas, ancho, alto)
@@ -223,7 +255,7 @@ async def predict(file: UploadFile = File(...)):
 
             if profundidad_sku is None or profundidad_rejilla is None:
                 faltantes = 0
-                inventario_estimado = capacidad_max  # En caso de no detectar rejilla, se asume lleno o detección base
+                inventario_estimado = capacidad_max
                 diferencia = 0.0
                 estado = "sin_profundidad_o_rejilla"
             else:
@@ -234,7 +266,7 @@ async def predict(file: UploadFile = File(...)):
                 faltantes = int(round(diferencia / max(paso_profundidad, 1e-6)))
                 faltantes = int(np.clip(faltantes, 0, capacidad_max))
                 
-                # Inventario Estimado = Capacidad Máxima (12 piezas) - Faltantes
+                # Inventario Estimado = Capacidad Máxima - Faltantes
                 inventario_estimado = capacidad_max - faltantes
                 estado = "estimado_exitoso"
 
