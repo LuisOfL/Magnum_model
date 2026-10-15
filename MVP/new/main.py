@@ -1,51 +1,154 @@
 import base64
 import io
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
+import numpy as np
+import torch
+import torch.nn.functional as F
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from PIL import Image, ImageOps
+from transformers import pipeline
 from ultralytics import YOLO
 
-app = FastAPI(title="YOLO Freezer Inventory Estimator API")
+app = FastAPI(title="Smart Freezer Audit API - Estimación por Profundidad")
 
-# Definición de rutas principales
 BASE_DIR = Path(__file__).parent.resolve()
+
+# ---------------------------------------------------------
+# Carga de Modelos YOLO y Depth Anything
+# ---------------------------------------------------------
 MODEL_PATH = BASE_DIR / "best.pt"
-CLASSES_PATH = BASE_DIR / "classes.txt"
+SEG_MODEL_PATH = BASE_DIR / "segmentation.pt"
 
 if not MODEL_PATH.exists():
-    raise FileNotFoundError(f"No se encontró el archivo de pesos en {MODEL_PATH}")
+    raise FileNotFoundError(f"No se encontró el modelo de detección: {MODEL_PATH}")
 
-# Carga del modelo YOLO
+if not SEG_MODEL_PATH.exists():
+    raise FileNotFoundError(f"No se encontró el modelo de segmentación: {SEG_MODEL_PATH}")
+
+USE_CUDA = torch.cuda.is_available()
+PIPELINE_DEVICE = 0 if USE_CUDA else -1
+YOLO_DEVICE = 0 if USE_CUDA else "cpu"
+
 model = YOLO(str(MODEL_PATH))
+seg_model = YOLO(str(SEG_MODEL_PATH))
 
-# Cargar las clases desde classes.txt por su índice de línea (0 a N)
+# Estimador de profundidad monocular
+depth_estimator = pipeline(
+    task="depth-estimation",
+    model="depth-anything/Depth-Anything-V2-Small-hf",
+    device=PIPELINE_DEVICE,
+)
+
+# Nombres de clases
+CLASSES_PATH = BASE_DIR / "classes.txt"
 CLASS_NAMES: Dict[int, str] = {}
 if CLASSES_PATH.exists():
     with open(CLASSES_PATH, "r", encoding="utf-8") as f:
         CLASS_NAMES = {i: line.strip() for i, line in enumerate(f) if line.strip()}
 
-# -----------------------------------------------------------------------------
-# DICCIONARIO DE CAPACIDADES MÁXIMAS POR CANAL/CARRIL Y TIPO DE SKU
-# Define la cantidad de piezas estimadas que entran en la profundidad de un carril.
-# -----------------------------------------------------------------------------
+# Capacidades predeterminadas por tipo de SKU
 CAPACIDADES_POR_SKU: Dict[str, int] = {
     "Magnum": 12,
     "Mordisko": 11,
     "Cornetto": 10,
     "Solero": 10,
     "Pint": 8,
-    "DEFAULT": 10  # Capacidad por defecto
+    "DEFAULT": 12,  # 12 piezas por defecto a nivel de rejilla
 }
 
+# Paso de profundidad estimado por pieza (distancia relativa que ocupa 1 producto)
+PASO_PROFUNDIDAD_POR_SKU: Dict[str, float] = {
+    "Magnum": 0.050,
+    "Mordisko": 0.045,
+    "Cornetto": 0.050,
+    "Solero": 0.050,
+    "Pint": 0.060,
+    "DEFAULT": 0.050,
+}
 
-def obtener_capacidad_sku(nombre_sku: str) -> int:
-    """Busca la capacidad asignada al SKU o retorna la capacidad por defecto."""
-    for key, cap in CAPACIDADES_POR_SKU.items():
-        if key.lower() in nombre_sku.lower():
-            return cap
-    return CAPACIDADES_POR_SKU["DEFAULT"]
+REJILLA_KEYWORDS = (
+    "rejilla", "canastilla", "separador", "carril", "parrilla", "estante"
+)
+
+
+def obtener_config_sku(nombre: str, mapa_config: Dict, default_key="DEFAULT"):
+    """Busca la configuración correspondiente según la etiqueta del SKU."""
+    for clave, valor in mapa_config.items():
+        if clave != default_key and clave.lower() in nombre.lower():
+            return valor
+    return mapa_config[default_key]
+
+
+def calcular_mapa_profundidad(pil_img: Image.Image) -> np.ndarray:
+    """Genera el mapa de profundidad con Depth Anything V2 y lo escala a la imagen original."""
+    salida = depth_estimator(pil_img)
+    predicted = salida.get("predicted_depth")
+
+    if predicted is None:
+        depth = np.asarray(salida["depth"], dtype=np.float32)
+        depth_img = Image.fromarray(depth).resize(pil_img.size, Image.Resampling.BICUBIC)
+        return np.asarray(depth_img, dtype=np.float32)
+
+    if predicted.ndim == 2:
+        predicted = predicted.unsqueeze(0).unsqueeze(0)
+    elif predicted.ndim == 3:
+        predicted = predicted.unsqueeze(1)
+
+    predicted = F.interpolate(
+        predicted.float(),
+        size=(pil_img.height, pil_img.width),
+        mode="bicubic",
+        align_corners=False,
+    )[0, 0]
+    return predicted.detach().cpu().numpy().astype(np.float32)
+
+
+def normalizar_mapa_profundidad(depth: np.ndarray) -> np.ndarray:
+    """Normaliza el mapa de profundidad entre 0 y 1 ignorando valores atípicos."""
+    validos = depth[np.isfinite(depth)]
+    if validos.size == 0:
+        return np.zeros_like(depth, dtype=np.float32)
+    minimo, maximo = np.percentile(validos, [2, 98])
+    rango = float(maximo - minimo)
+    if rango < 1e-6:
+        return np.zeros_like(depth, dtype=np.float32)
+    return np.clip((depth - minimo) / rango, 0.0, 1.0).astype(np.float32)
+
+
+def extraer_profundidad_bbox(depth: np.ndarray, item: Dict, factor_recorte: float = 0.50) -> Optional[float]:
+    """Obtiene la mediana de profundidad en la región central de la bounding box."""
+    if not item:
+        return None
+    
+    alto, ancho = depth.shape
+    cx = (item["x1"] + item["x2"]) / 2.0
+    cy = (item["y1"] + item["y2"]) / 2.0
+    bw = (item["x2"] - item["x1"]) * factor_recorte
+    bh = (item["y2"] - item["y1"]) * factor_recorte
+
+    x1 = max(0, int(cx - bw / 2))
+    y1 = max(0, int(cy - bh / 2))
+    x2 = min(ancho, int(cx + bw / 2))
+    y2 = min(alto, int(cy + bh / 2))
+
+    region = depth[y1:y2, x1:x2]
+    validos = region[np.isfinite(region)]
+    return float(np.median(validos)) if validos.size > 0 else None
+
+
+def buscar_rejilla_mas_cercana(producto: Dict, rejillas: List[Dict], ancho: int, alto: int) -> Optional[Dict]:
+    """Encuentra la rejilla más cercana a la bounding box del SKU mediante distancia euclidiana."""
+    if not rejillas:
+        return None
+
+    def distancia(r):
+        dx = (producto["x_centro"] - r["x_centro"]) / max(1, ancho)
+        dy = (producto["y_centro"] - r["y_centro"]) / max(1, alto)
+        return np.hypot(dx, dy)
+
+    return min(rejillas, key=distancia)
 
 
 @app.post("/predict")
@@ -54,193 +157,137 @@ async def predict(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="El archivo debe ser una imagen válida.")
 
     try:
-        # 1. Leer imagen y corregir orientación según metadatos EXIF (Solución a fotos giradas)
         image_bytes = await file.read()
-        pil_img = Image.open(io.BytesIO(image_bytes))
-        pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
-        img_width, img_height = pil_img.size
+        pil_img = ImageOps.exif_transpose(
+            Image.open(io.BytesIO(image_bytes))
+        ).convert("RGB")
+        ancho, alto = pil_img.size
 
-        # 2. Inferencia con YOLO
-        results = model(pil_img, conf=0.25)
-        result = results[0]
+        # 1. Detección de SKUs y Rejilla con YOLO Bounding Boxes
+        resultado = model(pil_img, conf=0.25, device=YOLO_DEVICE)[0]
 
-        # Generar imagen anotada codificada en Base64 para Flet
-        annotated_bgr = result.plot()
-        annotated_rgb = annotated_bgr[:, :, ::-1]
-        annotated_pil = Image.fromarray(annotated_rgb)
+        # 2. Segmentación con YOLO Polígonos
+        resultado_seg = seg_model(
+            pil_img, 
+            conf=0.25, 
+            device=YOLO_DEVICE,
+            retina_masks=True
+        )[0]
 
-        buffer = io.BytesIO()
-        annotated_pil.save(buffer, format="JPEG")
-        img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-        # 3. Extraer productos y rejillas/estantes
         productos = []
         rejillas = []
 
-        if result.boxes is not None and len(result.boxes) > 0:
-            for box in result.boxes:
-                cls_id = int(box.cls[0].item())
-
-                if cls_id in CLASS_NAMES:
-                    nombre_clase = CLASS_NAMES[cls_id]
-                elif hasattr(model, "names") and cls_id in model.names:
-                    nombre_clase = model.names[cls_id]
-                else:
-                    nombre_clase = f"Clase_{cls_id}"
-
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                x_centro = (x1 + x2) / 2.0
-                y_centro = (y1 + y2) / 2.0
-
-                es_rejilla = any(
-                    kw in nombre_clase.lower()
-                    for kw in ["rejilla", "canastilla", "separador", "carril", "parrilla", "estante"]
+        if resultado.boxes is not None:
+            for indice, box in enumerate(resultado.boxes):
+                clase_id = int(box.cls[0].item())
+                nombre = CLASS_NAMES.get(
+                    clase_id,
+                    model.names.get(clase_id, f"Clase_{clase_id}"),
                 )
+                x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
+                deteccion = {
+                    "id_deteccion": indice,
+                    "nombre": nombre,
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                    "x_centro": (x1 + x2) / 2.0,
+                    "y_centro": (y1 + y2) / 2.0,
+                    "confianza": float(box.conf[0].item()),
+                }
 
-                if es_rejilla:
-                    rejillas.append({
-                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                        "x_centro": x_centro, "y_centro": y_centro
-                    })
+                if any(k in nombre.lower() for k in REJILLA_KEYWORDS):
+                    rejillas.append(deteccion)
                 else:
-                    productos.append({
-                        "nombre": nombre_clase,
-                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                        "x_centro": x_centro, "y_centro": y_centro
-                    })
+                    productos.append(deteccion)
 
-        detecciones_filtradas = []
+        # 3. Estimación de Mapa de Profundidad con Depth Anything V2
+        depth_map = normalizar_mapa_profundidad(calcular_mapa_profundidad(pil_img))
 
-        if productos:
-            # Conteo de detecciones visibles reales por etiqueta
-            conteo_visibles: Dict[str, int] = {}
-            for p in productos:
-                nom = p["nombre"]
-                conteo_visibles[nom] = conteo_visibles.get(nom, 0) + 1
+        detalle_detecciones = []
+        resumen_por_sku: Dict[str, Dict] = {}
 
-            # =========================================================================
-            # PASO 1: AGRUPACIÓN BI-DIMENSIONAL (NIVELES EN Y -> CARRILES EN X)
-            # =========================================================================
-            # Ordenar productos de arriba a abajo por su eje Y
-            productos_ordenados_y = sorted(productos, key=lambda p: p["y_centro"])
+        # 4. Cálculo de diferencias de profundidad por cada SKU detectado
+        for producto in productos:
+            nombre = producto["nombre"]
+            capacidad_max = int(obtener_config_sku(nombre, CAPACIDADES_POR_SKU))
+            paso_profundidad = float(obtener_config_sku(nombre, PASO_PROFUNDIDAD_POR_SKU))
 
-            # 1.1 Segmentar en estantes horizontales (Niveles Y)
-            estantes = []
-            estante_actual = []
-            y_ref = -1
-            tolerancia_estante_y = img_height * 0.12  # Tolerancia vertical (~12% de la altura de la imagen)
+            # Rejilla de referencia asociada
+            rejilla = buscar_rejilla_mas_cercana(producto, rejillas, ancho, alto)
 
-            for p in productos_ordenados_y:
-                if y_ref == -1:
-                    estante_actual.append(p)
-                    y_ref = p["y_centro"]
-                elif abs(p["y_centro"] - y_ref) < tolerancia_estante_y:
-                    estante_actual.append(p)
-                    # Promedio móvil para adaptar variaciones en el eje Y
-                    y_ref = sum(item["y_centro"] for item in estante_actual) / len(estante_actual)
-                else:
-                    estantes.append(estante_actual)
-                    estante_actual = [p]
-                    y_ref = p["y_centro"]
-            if estante_actual:
-                estantes.append(estante_actual)
+            # Extraer profundidad de SKU y Rejilla
+            profundidad_sku = extraer_profundidad_bbox(depth_map, producto)
+            profundidad_rejilla = extraer_profundidad_bbox(depth_map, rejilla) if rejilla else None
 
-            # 1.2 Dentro de cada estante, agrupar por carriles/columnas (Eje X)
-            carriles_totales = []
+            if profundidad_sku is None or profundidad_rejilla is None:
+                faltantes = 0
+                inventario_estimado = capacidad_max  # En caso de no detectar rejilla, se asume lleno o detección base
+                diferencia = 0.0
+                estado = "sin_profundidad_o_rejilla"
+            else:
+                # Diferencia de profundidad entre la rejilla y el SKU
+                diferencia = abs(profundidad_sku - profundidad_rejilla)
 
-            for estante in estantes:
-                # Límites verticales del estante actual
-                y_min_estante = min(p["y1"] for p in estante)
-                y_max_estante = max(p["y2"] for p in estante)
-                y_top_estante = max(0.0, y_min_estante - img_height * 0.02)
-                y_bottom_estante = min(img_height, y_max_estante + img_height * 0.02)
+                # Si está al mismo nivel (diferencia cercana a 0), no faltan productos
+                faltantes = int(round(diferencia / max(paso_profundidad, 1e-6)))
+                faltantes = int(np.clip(faltantes, 0, capacidad_max))
+                
+                # Inventario Estimado = Capacidad Máxima (12 piezas) - Faltantes
+                inventario_estimado = capacidad_max - faltantes
+                estado = "estimado_exitoso"
 
-                # Ordenar horizontalmente los productos de este estante
-                estante_ordenado_x = sorted(estante, key=lambda p: p["x_centro"])
-                col_carril = []
-                x_ref = -1
-                tolerancia_carril_x = img_width * 0.08  # Tolerancia horizontal (~8% del ancho)
+            detalle = {
+                "id_deteccion": producto["id_deteccion"],
+                "sku": nombre,
+                "rejilla_asociada_id": rejilla["id_deteccion"] if rejilla else None,
+                "profundidad_sku": round(profundidad_sku, 6) if profundidad_sku else None,
+                "profundidad_rejilla": round(profundidad_rejilla, 6) if profundidad_rejilla else None,
+                "diferencia_profundidad": round(diferencia, 6) if diferencia is not None else None,
+                "capacidad_maxima": capacidad_max,
+                "faltantes_calculados": faltantes,
+                "inventario_estimado": inventario_estimado,
+                "estado": estado,
+            }
+            detalle_detecciones.append(detalle)
 
-                for p in estante_ordenado_x:
-                    if x_ref == -1:
-                        col_carril.append(p)
-                        x_ref = p["x_centro"]
-                    elif abs(p["x_centro"] - x_ref) < tolerancia_carril_x:
-                        col_carril.append(p)
-                    else:
-                        carriles_totales.append({
-                            "y_top": y_top_estante,
-                            "y_bottom": y_bottom_estante,
-                            "productos": col_carril
-                        })
-                        col_carril = [p]
-                        x_ref = p["x_centro"]
-                if col_carril:
-                    carriles_totales.append({
-                        "y_top": y_top_estante,
-                        "y_bottom": y_bottom_estante,
-                        "productos": col_carril
-                    })
+            # Acumular resumen por categoría de SKU
+            resumen = resumen_por_sku.setdefault(nombre, {
+                "etiqueta": nombre,
+                "visibles": 0,
+                "stock_estimado": 0,
+            })
+            resumen["visibles"] += 1
+            resumen["stock_estimado"] += inventario_estimado
 
-            # =========================================================================
-            # PASOS 2, 3 Y 4: ESTIMACIÓN DE PROFUNDIDAD POR CARRIL DE CADA ESTANTE
-            # =========================================================================
-            stock_estimado_por_sku: Dict[str, int] = {}
+        # 5. Generación de Imagen Anotada Bounding Boxes
+        anotada_bgr = resultado.plot(boxes=True, masks=False)
+        buffer_det = io.BytesIO()
+        Image.fromarray(anotada_bgr[:, :, ::-1]).save(buffer_det, format="JPEG", quality=90)
+        imagen_base64 = base64.b64encode(buffer_det.getvalue()).decode("utf-8")
 
-            for carril in carriles_totales:
-                prods_carril = carril["productos"]
-                if not prods_carril:
-                    continue
-
-                # SKU superior/frontal en este carril del estante
-                sku_superior = min(prods_carril, key=lambda p: p["y1"])
-                nombre_sku = sku_superior["nombre"]
-
-                y_top = carril["y_top"]
-                y_bottom = carril["y_bottom"]
-                y1_sku = sku_superior["y1"]
-
-                altura_total_estante = max(1.0, y_bottom - y_top)
-                altura_ocupada = max(0.0, y_bottom - y1_sku)
-
-                # Proporción de llenado del carril dentro del estante
-                ratio_llenado = max(0.0, min(1.0, altura_ocupada / altura_total_estante))
-
-                capacidad_max = obtener_capacidad_sku(nombre_sku)
-                piezas_estimadas_carril = int(round(ratio_llenado * capacidad_max))
-
-                # Garantizar que el estimado por carril no sea inferior a las piezas visibles en dicho carril
-                visibles_en_carril = len(prods_carril)
-                stock_carril = max(visibles_en_carril, piezas_estimadas_carril)
-
-                # Sumar la estimación de este carril al acumulado del tipo de SKU
-                stock_estimado_por_sku[nombre_sku] = (
-                    stock_estimado_por_sku.get(nombre_sku, 0) + stock_carril
-                )
-
-            # =========================================================================
-            # PASO 5: CONSOLIDAR RESULTADOS PARA EL FRONTEND (FLET)
-            # =========================================================================
-            for nombre_sku, num_visibles in conteo_visibles.items():
-                stock_est = stock_estimado_por_sku.get(nombre_sku, num_visibles)
-                stock_est = max(num_visibles, stock_est)
-
-                detecciones_filtradas.append({
-                    "etiqueta": nombre_sku,
-                    "visibles": num_visibles,
-                    "frecuencia": stock_est
-                })
+        # 6. Generación de Imagen Anotada Segmentación
+        anotada_seg_bgr = resultado_seg.plot(boxes=False, masks=True)
+        buffer_seg = io.BytesIO()
+        Image.fromarray(anotada_seg_bgr[:, :, ::-1]).save(buffer_seg, format="JPEG", quality=90)
+        imagen_seg_base64 = base64.b64encode(buffer_seg.getvalue()).decode("utf-8")
 
         return {
             "status": "success",
-            "imagen_base64": img_base64,
-            "detecciones": detecciones_filtradas,
+            "imagen_base64": imagen_base64,
+            "imagen_seg_base64": imagen_seg_base64,
+            "detecciones": list(resumen_por_sku.values()),
+            "detalle_detecciones": detalle_detecciones,
+            "total_skus_detectados": len(productos),
+            "total_rejillas_detectadas": len(rejillas),
         }
 
-    except Exception as e:
+    except Exception as error:
         raise HTTPException(
-            status_code=500, detail=f"Error en inferencia y estimación de inventario: {str(e)}"
-        )
+            status_code=500,
+            detail=f"Error en procesamiento de auditoría: {error}",
+        ) from error
 
 
 if __name__ == "__main__":
