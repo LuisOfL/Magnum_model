@@ -11,9 +11,9 @@ This repository is structured into three main component directories:
 .
 ├── 📁 01_yolo_detection_training/     # YOLO Object Detection Training Pipeline
 ├── 📁 02_yolo_segmentation_training/  # YOLO Instance Segmentation Training Pipeline
-└── 📁 03_freezer_audit_app/           # Real-Time Audit Tool & AI Refinement Interface
-
----
+└── 📁 03_MVP/           # Tool to test and improve model
+```
+----
 
 ## 📂 Module Descriptions
 
@@ -25,7 +25,7 @@ Contains the scripts, configuration files, and dataset processing utilities requ
 Contains the training pipeline for the **YOLO Instance Segmentation Model**.
 * **Purpose:** Generates precise pixel-level masks for structural elements inside the freezer (such as grid dividers, baskets, lanes, and shelves). These masks define spatial boundaries used for depth calibration.
 
-### 3. `03_freezer_audit_app/`
+### 3. `03_MVP/`
 The core client-facing application and testing suite built using **FastAPI** (Backend) and **Flet** (Frontend UI).
 * **Key Capabilities:**
   * **Multi-Model Inference:** Runs Object Detection (YOLO), Instance Segmentation (YOLO-Seg), and Monocular Depth Estimation (*Depth Anything V2*) in parallel.
