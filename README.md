@@ -27,11 +27,7 @@ Contains the training pipeline for the **YOLO Instance Segmentation Model**.
 
 ### 3. `03_MVP/`
 The core client-facing application and testing suite built using **FastAPI** (Backend) and **Flet** (Frontend UI).
-* **Key Capabilities:**
-  * **Multi-Model Inference:** Runs Object Detection (YOLO), Instance Segmentation (YOLO-Seg), and Monocular Depth Estimation (*Depth Anything V2*) in parallel.
-  * **k-NN Spatial Depth Estimation:** Uses $k$-Nearest Neighbors ($k$-NN) matching between detected product centers and structural grid coordinates to calculate relative stock depletion per SKU/lane.
-  * **Visual Heatmaps:** Renders colorized depth heatmaps (`cv2.COLORMAP_INFERNO`) alongside detection and segmentation outputs.
-  * **Model Refinement & Debugging:** Includes detailed per-item evaluation logs (depth values, confidence scores, capacity limits, and missing stock counts) to benchmark and fine-tune model parameters and calibration rules.
+
 
 ---
 
